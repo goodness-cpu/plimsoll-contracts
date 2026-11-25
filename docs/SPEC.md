@@ -43,7 +43,7 @@ it exists to show the integration in about 100 lines.
 
 | Type | Kind | Fields / variants |
 | --- | --- | --- |
-| `Role` | `u32` enum | `Auditor = 1`, `Transcriber = 2`, `SupplyPoster = 3` |
+| `Role` | `u32` enum | `Auditor = 1`, `Transcriber = 2`, `SupplyPoster = 3`, `Watcher = 4` |
 | `Tier` | `u32` enum | `Transcribed = 1`, `IssuerSigned = 2`, `AuditorSigned = 3` (ordered: higher is stronger) |
 | `ReporterInfo` | struct | `role: Role`, `name: String`, `added_at: u64` |
 | `AssetRecord` | struct | `sac: Address`, `code: String`, `issuer: Address`, `listed_at: u64` |
@@ -203,8 +203,25 @@ Decides who may speak. Holds no money.
 | `cancel_upgrade()` | admin | `()` | `UpgradeNotProposed` | `upgrade_cancelled {wasm_hash}` |
 | `pending_upgrade()` | — | `Option<PendingUpgrade>` | — | — |
 
-Errors (`RegistryError`): `ReporterNotFound = 1`, `InvalidName = 2`.
+Errors (`RegistryError`): `ReporterNotFound = 1`, `InvalidName = 2`, `UpgradeNotProposed = 3`, `UpgradeDelayNotElapsed = 4`.
 Causes and remedies: [ERRORS.md](ERRORS.md#registryerror).
+
+### Reporter expiry (issue #92)
+
+An admin may set a Unix-timestamp expiry on any registered reporter with
+`set_expiry`. The view `is_reporter_active` returns `false` once
+`env.ledger().timestamp() >= expires_at`; the comparison is always against the
+**ledger timestamp** (`u64`, Unix seconds), never against the ledger sequence
+number (`u32`). A reporter with no expiry entry is permanently active.
+
+| Key | Storage | Value |
+| --- | --- | --- |
+| `Expiry(Address)` | persistent, TTL extended on write | `u64` (Unix timestamp) |
+
+| Function | Auth | Returns | Errors | Event |
+| --- | --- | --- | --- | --- |
+| `set_expiry(reporter: Address, expires_at: u64)` | admin | `()` | `ReporterNotFound` | `reporter_expiry_set {reporter} expires_at` |
+| `is_reporter_active(reporter: Address)` | — | `bool` | — | — |
 
 ## coverage-ledger
 
@@ -222,6 +239,12 @@ Records what was said, and answers coverage questions.
 | `ReportBy(Address, Tier, Address)` | persistent | `ReserveReport`: the latest from one reporter at one tier for one asset |
 | `Reporters(Address, Tier)` | persistent | `Vec<Address>`: the reporters with a `ReportBy` entry at that tier, in the order they first posted; at most `MAX_REPORTERS_PER_TIER = 4` |
 | `Report(Address, Tier)` | persistent | `ReserveReport`: the v0.1 layout (one per tier). Read until migrated, never written; see [Upgrading a v0.1 deployment](#upgrading-a-v01-deployment) |
+| `RecentReports` | persistent | `Vec<RecentReport>`: the most recently posted reports across all assets, newest first, capped at 50 |
+| `Dispute(Address, u64)` | persistent | `DisputeRecord`: an active dispute keyed by `(sac, as_of)` |
+| `DisputeHold` | instance | `u32`: number of ledgers a disputed report is frozen for (default: `DAY_IN_LEDGERS`) |
+
+`RecentReport` is a local `#[contracttype]` struct `{ sac: Address, report: ReserveReport }`.
+`DisputeRecord` is a local `#[contracttype]` struct `{ disputer: Address, hold_until_ledger: u32 }`.
 
 Every reporter keeps their own figure. Two auditors' reports coexist, and a
 transcriber who posts a later `as_of` adds a fresher figure without erasing
@@ -267,8 +290,15 @@ data layouts, with real testnet examples, are in [EVENTS.md](EVENTS.md).
 | `get_supply(sac)` | — | `Option<SupplySnapshot>` | — | — |
 | `get_report(sac, tier: Tier)` | — | `Option<ReserveReport>` (the freshest report at that tier that counts) | — | — |
 | `get_reports(sac)` | — | `Vec<ReserveReport>` (every stored report that counts: strongest tier first, then first-post order within a tier) | — | — |
+| `get_recent_reports(n: u32)` | — | `Vec<RecentReport>` (the min(n, 50) most recently posted reports across all assets, newest first) | — | — |
 | `coverage(sac, min_tier: Tier)` | — | `Option<Coverage>` | — | — |
+| `coverage_bps(sac: Address, max_age: u64)` | — | `Option<u128>` (basis-point coverage as u128; `None` when no live report or supply is within `max_age` seconds) | — | — |
 | `is_covered(sac, min_bps: u32, max_age: u64, min_tier: Tier)` | — | `bool` | — | — |
+| `dispute_report(watcher: Address, sac: Address, as_of: u64)` | watcher (must have `Role::Watcher`) | `()` | `AssetNotListed`, `NotAWatcher`, `AlreadyDisputed` | `report_disputed {sac, as_of} disputer, hold_until_ledger` |
+| `get_dispute_status(sac: Address, as_of: u64)` | — | `Option<DisputeRecord>` | — | — |
+| `resolve_dispute(sac: Address, as_of: u64)` | admin | `()` | `DisputeNotFound` | `dispute_resolved {sac, as_of}` |
+| `set_dispute_hold(n: u32)` | admin | `()` | — | — |
+| `get_dispute_hold()` | — | `u32` | — | — |
 | `registry()` / `admin()` | — | `Address` | — | — |
 | `transfer_admin(new_admin)` | admin and new_admin | `()` | — | `admin_transferred` |
 | `propose_upgrade(wasm_hash: BytesN<32>)` | admin | `()` | — | `upgrade_proposed {wasm_hash} executable_at_ledger` |
