@@ -1,6 +1,7 @@
 extern crate std;
 
 use super::*;
+use plimsoll_types::DAY_IN_LEDGERS;
 use reporter_registry::{ReporterRegistry, ReporterRegistryClient};
 use soroban_sdk::{
     testutils::{Address as _, AuthorizedFunction, Events, Ledger as _, MockAuth, MockAuthInvoke},
@@ -1679,4 +1680,295 @@ fn a_new_proposal_restarts_the_clock() {
         f.ledger.try_execute_upgrade(),
         Err(Ok(LedgerError::UpgradeDelayNotElapsed.into()))
     );
+}
+
+// ---- get_recent_reports (issue #90) ----------------------------------------
+
+#[test]
+fn recent_reports_empty_before_any_post() {
+    let f = listed();
+    assert_eq!(f.ledger.get_recent_reports(&0).len(), 0);
+    assert_eq!(f.ledger.get_recent_reports(&50).len(), 0);
+}
+
+#[test]
+fn recent_reports_newest_first() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0 - 300);
+    post(&f, &f.issuer, 2 * UNIT, T0 - 200);
+    post(&f, &f.transcriber, 3 * UNIT, T0 - 100);
+
+    let recent = f.ledger.get_recent_reports(&10);
+    assert_eq!(recent.len(), 3);
+    // Most recently posted is first.
+    assert_eq!(recent.get(0).unwrap().report.amount, 3 * UNIT);
+    assert_eq!(recent.get(1).unwrap().report.amount, 2 * UNIT);
+    assert_eq!(recent.get(2).unwrap().report.amount, UNIT);
+}
+
+#[test]
+fn recent_reports_includes_sac() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0);
+    let recent = f.ledger.get_recent_reports(&1);
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent.get(0).unwrap().sac, f.sac);
+}
+
+#[test]
+fn recent_reports_n_caps_the_result() {
+    let f = listed();
+    for i in 1u64..=5 {
+        post(&f, &f.auditor, UNIT * i as i128, T0 - (10 - i));
+    }
+    let recent = f.ledger.get_recent_reports(&3);
+    assert_eq!(recent.len(), 3);
+}
+
+#[test]
+fn recent_reports_capped_at_50() {
+    let f = listed();
+    // Rotate through reporters to stay under the per-tier cap.
+    let mut auditors = std::vec![f.auditor.clone()];
+    for _ in 1..MAX_REPORTERS_PER_TIER {
+        auditors.push(add_reporter(&f, Role::Auditor));
+    }
+    // Post 60 reports across the 4 auditors (15 each).
+    for i in 0u64..60 {
+        let reporter = &auditors[(i as usize) % MAX_REPORTERS_PER_TIER as usize];
+        f.ledger.post_reserve(
+            reporter,
+            &f.sac,
+            &UNIT,
+            &(T0 + i),
+            &hash(&f.env, (i % 255) as u8),
+            &uri(&f.env),
+        );
+    }
+    // get_recent_reports(100) is still bounded at 50.
+    let recent = f.ledger.get_recent_reports(&100);
+    assert_eq!(recent.len(), 50);
+}
+
+#[test]
+fn recent_reports_zero_n_returns_empty() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0);
+    assert_eq!(f.ledger.get_recent_reports(&0).len(), 0);
+}
+
+// ---- coverage_bps view (issue #93) -----------------------------------------
+
+#[test]
+fn coverage_bps_view_none_without_data() {
+    let f = listed();
+    let day = 86_400u64;
+    assert_eq!(f.ledger.coverage_bps(&f.sac, &day), None);
+    // Supply only — no report.
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    assert_eq!(f.ledger.coverage_bps(&f.sac, &day), None);
+}
+
+#[test]
+fn coverage_bps_view_returns_bps_as_u128() {
+    let f = listed();
+    let day = 86_400u64;
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    f.ledger.post_reserve(
+        &f.auditor,
+        &f.sac,
+        &(102 * UNIT),
+        &(T0 - 100),
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+    let bps = f.ledger.coverage_bps(&f.sac, &day).unwrap();
+    assert_eq!(bps, 10_200u128);
+}
+
+#[test]
+fn coverage_bps_view_none_when_supply_stale() {
+    let f = listed();
+    let max_age = 3_600u64; // 1 hour
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    f.ledger.post_reserve(
+        &f.issuer,
+        &f.sac,
+        &(100 * UNIT),
+        &T0,
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+    // Two hours later supply is stale.
+    f.env.ledger().set_timestamp(T0 + 2 * max_age);
+    assert_eq!(f.ledger.coverage_bps(&f.sac, &max_age), None);
+}
+
+#[test]
+fn coverage_bps_view_none_when_report_stale() {
+    let f = listed();
+    let max_age = 3_600u64;
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    f.ledger.post_reserve(
+        &f.issuer,
+        &f.sac,
+        &(100 * UNIT),
+        &(T0 - 2 * max_age - 1),
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+    assert_eq!(f.ledger.coverage_bps(&f.sac, &max_age), None);
+}
+
+#[test]
+fn coverage_bps_view_uses_weakest_tier_floor() {
+    let f = listed();
+    let day = 86_400u64;
+    f.ledger
+        .post_supply(&f.poster, &f.sac, &(100 * UNIT), &990, &hash(&f.env, 1));
+    // Only a transcribed report.
+    f.ledger.post_reserve(
+        &f.transcriber,
+        &f.sac,
+        &(75 * UNIT),
+        &(T0 - 60),
+        &hash(&f.env, 2),
+        &uri(&f.env),
+    );
+    let bps = f.ledger.coverage_bps(&f.sac, &day).unwrap();
+    assert_eq!(bps, 7_500u128);
+}
+
+// ---- dispute resolution (issue #91) ----------------------------------------
+
+fn register_watcher(f: &Fixture) -> Address {
+    let w = Address::generate(&f.env);
+    f.registry
+        .set_reporter(&w, &Role::Watcher, &String::from_str(&f.env, "watcher"));
+    w
+}
+
+#[test]
+fn dispute_freezes_report_from_coverage() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.auditor, 100 * UNIT, T0 - 60);
+    let watcher = register_watcher(&f);
+
+    assert!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned).is_some());
+    f.ledger.dispute_report(&watcher, &f.sac, &(T0 - 60));
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned), None);
+}
+
+#[test]
+fn dispute_stores_a_dispute_record() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.auditor, 100 * UNIT, T0);
+    let watcher = register_watcher(&f);
+
+    f.ledger.dispute_report(&watcher, &f.sac, &T0);
+    let record = f.ledger.get_dispute_status(&f.sac, &T0).unwrap();
+    assert_eq!(record.disputer, watcher);
+    assert_eq!(
+        record.hold_until_ledger,
+        1_000 + DEFAULT_DISPUTE_HOLD_LEDGERS
+    );
+}
+
+#[test]
+fn non_watcher_cannot_dispute() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0);
+    // f.auditor has Role::Auditor, not Watcher.
+    let res = f.ledger.try_dispute_report(&f.auditor, &f.sac, &T0);
+    assert_eq!(res, Err(Ok(LedgerError::NotAWatcher.into())));
+}
+
+#[test]
+fn duplicate_dispute_fails() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0);
+    let watcher = register_watcher(&f);
+    f.ledger.dispute_report(&watcher, &f.sac, &T0);
+    let res = f.ledger.try_dispute_report(&watcher, &f.sac, &T0);
+    assert_eq!(res, Err(Ok(LedgerError::AlreadyDisputed.into())));
+}
+
+#[test]
+fn admin_resolve_clears_the_dispute() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.auditor, 100 * UNIT, T0 - 60);
+    let watcher = register_watcher(&f);
+    f.ledger.dispute_report(&watcher, &f.sac, &(T0 - 60));
+
+    // Frozen.
+    assert_eq!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned), None);
+
+    // Admin resolves early.
+    f.ledger.resolve_dispute(&f.sac, &(T0 - 60));
+    assert_eq!(f.ledger.get_dispute_status(&f.sac, &(T0 - 60)), None);
+    // Report counts again.
+    assert!(f.ledger.coverage(&f.sac, &Tier::AuditorSigned).is_some());
+}
+
+#[test]
+fn resolve_nonexistent_dispute_fails() {
+    let f = listed();
+    let res = f.ledger.try_resolve_dispute(&f.sac, &T0);
+    assert_eq!(res, Err(Ok(LedgerError::DisputeNotFound.into())));
+}
+
+#[test]
+fn dispute_on_unlisted_asset_fails() {
+    let f = setup();
+    let watcher = register_watcher(&f);
+    let res = f.ledger.try_dispute_report(&watcher, &f.sac, &T0);
+    assert_eq!(res, Err(Ok(LedgerError::AssetNotListed.into())));
+}
+
+#[test]
+fn set_and_get_dispute_hold() {
+    let f = setup();
+    assert_eq!(f.ledger.get_dispute_hold(), DEFAULT_DISPUTE_HOLD_LEDGERS);
+    f.ledger.set_dispute_hold(&500);
+    assert_eq!(f.ledger.get_dispute_hold(), 500);
+}
+
+#[test]
+fn custom_dispute_hold_is_applied() {
+    let f = listed();
+    supply(&f, 100 * UNIT);
+    post(&f, &f.auditor, 100 * UNIT, T0);
+    let watcher = register_watcher(&f);
+    f.ledger.set_dispute_hold(&100);
+    f.ledger.dispute_report(&watcher, &f.sac, &T0);
+    let record = f.ledger.get_dispute_status(&f.sac, &T0).unwrap();
+    assert_eq!(record.hold_until_ledger, 1_000 + 100);
+}
+
+#[test]
+fn dispute_emits_event() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0);
+    let watcher = register_watcher(&f);
+    let count_before = f.env.events().all().events().len();
+    f.ledger.dispute_report(&watcher, &f.sac, &T0);
+    assert!(f.env.events().all().events().len() > count_before);
+}
+
+#[test]
+fn resolve_emits_event() {
+    let f = listed();
+    post(&f, &f.auditor, UNIT, T0);
+    let watcher = register_watcher(&f);
+    f.ledger.dispute_report(&watcher, &f.sac, &T0);
+    let count_before = f.env.events().all().events().len();
+    f.ledger.resolve_dispute(&f.sac, &T0);
+    assert!(f.env.events().all().events().len() > count_before);
 }

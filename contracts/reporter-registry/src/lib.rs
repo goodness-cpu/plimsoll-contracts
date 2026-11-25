@@ -192,7 +192,11 @@ impl ReporterRegistry {
             .persistent()
             .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
         bump_instance(&env);
-        ReporterExpirySet { reporter, expires_at }.publish(&env);
+        ReporterExpirySet {
+            reporter,
+            expires_at,
+        }
+        .publish(&env);
     }
 
     /// Returns `true` when `reporter` exists in the registry and either has no

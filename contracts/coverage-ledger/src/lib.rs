@@ -4,9 +4,10 @@
 #![no_std]
 
 use plimsoll_types::{
-    coverage_bps, AssetRecord, Coverage, PendingUpgrade, RegistryClient, ReserveReport, Role,
-    SupplySnapshot, Tier, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS,
-    MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
+    coverage_bps as compute_bps, AssetRecord, Coverage, PendingUpgrade, RegistryClient,
+    ReserveReport, Role, SupplySnapshot, Tier, DAY_IN_LEDGERS, INSTANCE_EXTEND_TO,
+    INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS, MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO,
+    PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
 };
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -23,6 +24,29 @@ const MAX_CODE_LEN: usize = 12;
 /// `coverage` reads, and so what every `is_covered` caller pays.
 pub const MAX_REPORTERS_PER_TIER: u32 = 4;
 
+/// Largest N accepted by `get_recent_reports`.
+pub const MAX_RECENT_REPORTS: u32 = 50;
+
+/// Default number of ledgers a disputed report is frozen before it is
+/// considered delisted. One day at 5-second close time.
+pub const DEFAULT_DISPUTE_HOLD_LEDGERS: u32 = DAY_IN_LEDGERS;
+
+/// A single entry in the cross-asset recent-reports index.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecentReport {
+    pub sac: Address,
+    pub report: ReserveReport,
+}
+
+/// An active dispute on a reserve report identified by `(sac, as_of)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub disputer: Address,
+    pub hold_until_ledger: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -37,6 +61,12 @@ enum DataKey {
     ReportBy(Address, Tier, Address),
     /// Reporters with a `ReportBy` entry at (sac, tier), in first-post order.
     Reporters(Address, Tier),
+    /// The N most recently posted reports across all assets (bounded at MAX_RECENT_REPORTS).
+    RecentReports,
+    /// An active dispute on a report: keyed by (sac, as_of).
+    Dispute(Address, u64),
+    /// Configurable freeze period (in ledgers) for disputed reports.
+    DisputeHold,
 }
 
 #[contracterror]
@@ -58,6 +88,9 @@ pub enum LedgerError {
     TooManyReporters = 13,
     UpgradeNotProposed = 14,
     UpgradeDelayNotElapsed = 15,
+    NotAWatcher = 16,
+    AlreadyDisputed = 17,
+    DisputeNotFound = 18,
 }
 
 #[contractevent]
@@ -123,6 +156,26 @@ pub struct UpgradeCancelled {
     pub wasm_hash: BytesN<32>,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReportDisputed {
+    #[topic]
+    pub sac: Address,
+    #[topic]
+    pub as_of: u64,
+    pub disputer: Address,
+    pub hold_until_ledger: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolved {
+    #[topic]
+    pub sac: Address,
+    #[topic]
+    pub as_of: u64,
+}
+
 #[contract]
 pub struct CoverageLedger;
 
@@ -148,6 +201,24 @@ fn bump_instance(env: &Env) {
 
 fn pending(env: &Env) -> Option<PendingUpgrade> {
     env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+fn dispute_hold_ledgers(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::DisputeHold)
+        .unwrap_or(DEFAULT_DISPUTE_HOLD_LEDGERS)
+}
+
+/// Returns `true` if `report` is under an active dispute or its hold has
+/// expired (making it effectively delisted). The check is against the current
+/// ledger sequence number.
+fn is_disputed(env: &Env, sac: &Address, report: &ReserveReport) -> bool {
+    let key = DataKey::Dispute(sac.clone(), report.as_of);
+    match read_persistent::<DisputeRecord>(env, &key) {
+        None => false,
+        Some(_) => true,
+    }
 }
 
 fn read_persistent<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
@@ -260,12 +331,16 @@ fn counts(registry: &RegistryClient, report: &ReserveReport) -> bool {
     registry.role_of(&report.reporter) == Some(needed)
 }
 
-/// The freshest report in `candidates` that still counts. Candidates come in
-/// priority order (strongest tier first, then first-post order), so on equal
-/// `as_of` the earlier one wins. The registry is asked only about the report
-/// that would win, and again only if that one no longer counts, so a fresh
-/// issuer-signed report costs no cross-contract call at all.
-fn pick_counting(env: &Env, mut candidates: Vec<ReserveReport>) -> Option<ReserveReport> {
+/// The freshest report in `candidates` that still counts and is not disputed.
+/// Candidates come in priority order (strongest tier first, then first-post
+/// order), so on equal `as_of` the earlier one wins. The registry is asked
+/// only about the report that would win, and again only if that one no longer
+/// counts, so a fresh issuer-signed report costs no cross-contract call at all.
+fn pick_counting(
+    env: &Env,
+    sac: &Address,
+    mut candidates: Vec<ReserveReport>,
+) -> Option<ReserveReport> {
     let registry = RegistryClient::new(env, &registry(env));
     loop {
         let mut best: Option<(u32, ReserveReport)> = None;
@@ -275,7 +350,7 @@ fn pick_counting(env: &Env, mut candidates: Vec<ReserveReport>) -> Option<Reserv
             }
         }
         let (i, report) = best?;
-        if counts(&registry, &report) {
+        if counts(&registry, &report) && !is_disputed(env, sac, &report) {
             return Some(report);
         }
         candidates.remove(i);
@@ -284,7 +359,7 @@ fn pick_counting(env: &Env, mut candidates: Vec<ReserveReport>) -> Option<Reserv
 
 /// The freshest counting report at `tier`.
 fn freshest_at(env: &Env, sac: &Address, tier: Tier) -> Option<ReserveReport> {
-    pick_counting(env, reports_at(env, sac, tier))
+    pick_counting(env, sac, reports_at(env, sac, tier))
 }
 
 fn best_report(env: &Env, sac: &Address, min_tier: Tier) -> Option<ReserveReport> {
@@ -294,7 +369,7 @@ fn best_report(env: &Env, sac: &Address, min_tier: Tier) -> Option<ReserveReport
             candidates.append(&reports_at(env, sac, tier));
         }
     }
-    pick_counting(env, candidates)
+    pick_counting(env, sac, candidates)
 }
 
 /// Drop index entries, and their reports, whose reporter no longer counts.
@@ -322,6 +397,21 @@ fn reclaim_slots(
         }
     }
     kept
+}
+
+/// Prepend `entry` to the cross-asset recent-reports ring (capped at
+/// `MAX_RECENT_REPORTS`). Called on every successful `post_reserve`.
+fn push_recent_report(env: &Env, entry: RecentReport) {
+    let key = DataKey::RecentReports;
+    let existing: Vec<RecentReport> = read_persistent(env, &key).unwrap_or_else(|| Vec::new(env));
+    let mut updated = Vec::new(env);
+    updated.push_back(entry);
+    for item in existing.iter() {
+        if updated.len() < MAX_RECENT_REPORTS {
+            updated.push_back(item);
+        }
+    }
+    write_persistent(env, &key, &updated);
 }
 
 #[contractimpl]
@@ -458,7 +548,7 @@ impl CoverageLedger {
                 // With no supply there is nothing to judge the figure against,
                 // and coverage_bps reports u32::MAX for it.
                 if supply.amount > 0 {
-                    let bps = coverage_bps(amount, supply.amount);
+                    let bps = compute_bps(amount, supply.amount);
                     if !(MIN_PLAUSIBLE_BPS..=MAX_PLAUSIBLE_BPS).contains(&bps) {
                         panic_with_error!(&env, LedgerError::ImplausibleAmount);
                     }
@@ -497,6 +587,13 @@ impl CoverageLedger {
             doc_uri: doc_uri.clone(),
         };
         write_persistent(&env, &key, &report);
+        push_recent_report(
+            &env,
+            RecentReport {
+                sac: sac.clone(),
+                report: report.clone(),
+            },
+        );
         bump_instance(&env);
         ReservePosted {
             sac,
@@ -544,7 +641,7 @@ impl CoverageLedger {
         let supply = read_persistent::<SupplySnapshot>(&env, &DataKey::Supply(sac.clone()))?;
         let report = best_report(&env, &sac, min_tier)?;
         Some(Coverage {
-            bps: coverage_bps(report.amount, supply.amount),
+            bps: compute_bps(report.amount, supply.amount),
             supply: supply.amount,
             reserves: report.amount,
             tier: report.tier,
@@ -564,6 +661,96 @@ impl CoverageLedger {
         let now = env.ledger().timestamp();
         let fresh = |t: u64| now.saturating_sub(t) <= max_age;
         fresh(coverage.supply_timestamp) && fresh(coverage.report_as_of) && coverage.bps >= min_bps
+    }
+
+    /// The min(n, 50) most recently posted reports across all listed assets,
+    /// in newest-first order.
+    pub fn get_recent_reports(env: Env, n: u32) -> Vec<RecentReport> {
+        let cap = n.min(MAX_RECENT_REPORTS);
+        let all: Vec<RecentReport> =
+            read_persistent(&env, &DataKey::RecentReports).unwrap_or_else(|| Vec::new(&env));
+        let len = all.len().min(cap);
+        let mut out = Vec::new(&env);
+        for i in 0..len {
+            out.push_back(all.get(i).unwrap());
+        }
+        out
+    }
+
+    /// The coverage of `sac` as basis points (`10_000 == 100 %`), returned as
+    /// `Option<u128>`. Returns `None` when no supply snapshot or report is
+    /// present, or when either is older than `max_age` seconds. The value is
+    /// the same scale as `Coverage::bps` but widened to `u128`.
+    pub fn coverage_bps(env: Env, sac: Address, max_age: u64) -> Option<u128> {
+        let supply = read_persistent::<SupplySnapshot>(&env, &DataKey::Supply(sac.clone()))?;
+        let report = best_report(&env, &sac, Tier::Transcribed)?;
+        let now = env.ledger().timestamp();
+        let fresh = |t: u64| now.saturating_sub(t) <= max_age;
+        if !fresh(supply.timestamp) || !fresh(report.as_of) {
+            return None;
+        }
+        Some(compute_bps(report.amount, supply.amount) as u128)
+    }
+
+    /// Freeze the report identified by `(sac, as_of)` for the configured
+    /// dispute hold period. Only a registered `Role::Watcher` may call this.
+    pub fn dispute_report(env: Env, watcher: Address, sac: Address, as_of: u64) {
+        watcher.require_auth();
+        require_listed(&env, &sac);
+        let role = RegistryClient::new(&env, &registry(&env)).role_of(&watcher);
+        if role != Some(Role::Watcher) {
+            panic_with_error!(&env, LedgerError::NotAWatcher);
+        }
+        let key = DataKey::Dispute(sac.clone(), as_of);
+        if read_persistent::<DisputeRecord>(&env, &key).is_some() {
+            panic_with_error!(&env, LedgerError::AlreadyDisputed);
+        }
+        let hold = dispute_hold_ledgers(&env);
+        let hold_until_ledger = env.ledger().sequence().saturating_add(hold);
+        let record = DisputeRecord {
+            disputer: watcher.clone(),
+            hold_until_ledger,
+        };
+        write_persistent(&env, &key, &record);
+        bump_instance(&env);
+        ReportDisputed {
+            sac,
+            as_of,
+            disputer: watcher,
+            hold_until_ledger,
+        }
+        .publish(&env);
+    }
+
+    /// The dispute record for `(sac, as_of)`, if one exists.
+    pub fn get_dispute_status(env: Env, sac: Address, as_of: u64) -> Option<DisputeRecord> {
+        read_persistent(&env, &DataKey::Dispute(sac, as_of))
+    }
+
+    /// Admin resolves a dispute early: removes the freeze so the report
+    /// counts again (or removes the delist marker once the hold has expired).
+    pub fn resolve_dispute(env: Env, sac: Address, as_of: u64) {
+        admin(&env).require_auth();
+        let key = DataKey::Dispute(sac.clone(), as_of);
+        if read_persistent::<DisputeRecord>(&env, &key).is_none() {
+            panic_with_error!(&env, LedgerError::DisputeNotFound);
+        }
+        env.storage().persistent().remove(&key);
+        bump_instance(&env);
+        DisputeResolved { sac, as_of }.publish(&env);
+    }
+
+    /// Set the number of ledgers a disputed report is frozen before it is
+    /// treated as delisted.
+    pub fn set_dispute_hold(env: Env, n: u32) {
+        admin(&env).require_auth();
+        env.storage().instance().set(&DataKey::DisputeHold, &n);
+        bump_instance(&env);
+    }
+
+    /// The current dispute hold period in ledgers.
+    pub fn get_dispute_hold(env: Env) -> u32 {
+        dispute_hold_ledgers(&env)
     }
 
     pub fn transfer_admin(env: Env, new_admin: Address) {
