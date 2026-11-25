@@ -44,6 +44,8 @@ pub enum Role {
     Auditor = 1,
     Transcriber = 2,
     SupplyPoster = 3,
+    /// A registered watcher may dispute reserve reports.
+    Watcher = 4,
 }
 
 /// How much weight a reserve report carries. Ordered: higher is stronger.
