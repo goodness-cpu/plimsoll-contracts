@@ -18,6 +18,8 @@ const MAX_NAME_LEN: u32 = 64;
 enum DataKey {
     Admin,
     Reporter(Address),
+    /// Unix-timestamp at which the reporter's registration expires.
+    Expiry(Address),
     PendingUpgrade,
 }
 
@@ -29,6 +31,14 @@ pub enum RegistryError {
     InvalidName = 2,
     UpgradeNotProposed = 3,
     UpgradeDelayNotElapsed = 4,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReporterExpirySet {
+    #[topic]
+    pub reporter: Address,
+    pub expires_at: u64,
 }
 
 #[contractevent]
@@ -162,6 +172,46 @@ impl ReporterRegistry {
                 .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
         }
         info
+    }
+
+    /// Set or update the Unix-timestamp after which `reporter` is considered
+    /// inactive. The comparison in `is_reporter_active` is always against
+    /// `env.ledger().timestamp()` (not `ledger().sequence()`).
+    pub fn set_expiry(env: Env, reporter: Address, expires_at: u64) {
+        admin(&env).require_auth();
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Reporter(reporter.clone()))
+        {
+            panic_with_error!(&env, RegistryError::ReporterNotFound);
+        }
+        let key = DataKey::Expiry(reporter.clone());
+        env.storage().persistent().set(&key, &expires_at);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+        bump_instance(&env);
+        ReporterExpirySet { reporter, expires_at }.publish(&env);
+    }
+
+    /// Returns `true` when `reporter` exists in the registry and either has no
+    /// expiry or its expiry has not yet been reached on the current ledger
+    /// timestamp. The expiry is compared against `env.ledger().timestamp()`
+    /// (a Unix second-resolution clock), not against `ledger().sequence()`.
+    pub fn is_reporter_active(env: Env, reporter: Address) -> bool {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Reporter(reporter.clone()))
+        {
+            return false;
+        }
+        let key = DataKey::Expiry(reporter);
+        match env.storage().persistent().get::<_, u64>(&key) {
+            None => true,
+            Some(expires_at) => env.ledger().timestamp() < expires_at,
+        }
     }
 
     pub fn transfer_admin(env: Env, new_admin: Address) {
