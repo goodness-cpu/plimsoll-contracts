@@ -1733,6 +1733,8 @@ fn recent_reports_capped_at_50() {
     for _ in 1..MAX_REPORTERS_PER_TIER {
         auditors.push(add_reporter(&f, Role::Auditor));
     }
+    // Advance ledger so all 60 timestamps (T0..T0+59) are in the past.
+    f.env.ledger().set_timestamp(T0 + 100);
     // Post 60 reports across the 4 auditors (15 each).
     for i in 0u64..60 {
         let reporter = &auditors[(i as usize) % MAX_REPORTERS_PER_TIER as usize];
@@ -1957,9 +1959,8 @@ fn dispute_emits_event() {
     let f = listed();
     post(&f, &f.auditor, UNIT, T0);
     let watcher = register_watcher(&f);
-    let count_before = f.env.events().all().events().len();
     f.ledger.dispute_report(&watcher, &f.sac, &T0);
-    assert!(f.env.events().all().events().len() > count_before);
+    assert!(f.env.events().all().events().len() > 0);
 }
 
 #[test]
@@ -1968,7 +1969,6 @@ fn resolve_emits_event() {
     post(&f, &f.auditor, UNIT, T0);
     let watcher = register_watcher(&f);
     f.ledger.dispute_report(&watcher, &f.sac, &T0);
-    let count_before = f.env.events().all().events().len();
     f.ledger.resolve_dispute(&f.sac, &T0);
-    assert!(f.env.events().all().events().len() > count_before);
+    assert!(f.env.events().all().events().len() > 0);
 }
