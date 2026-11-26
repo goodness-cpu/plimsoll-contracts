@@ -4,14 +4,12 @@
 #![no_std]
 
 use plimsoll_types::{
-    coverage_bps as compute_bps, AssetRecord, Coverage, PendingUpgrade, RegistryClient,
-    ReserveReport, Role, SupplySnapshot, Tier, DAY_IN_LEDGERS, INSTANCE_EXTEND_TO,
-    INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS, MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO,
-    PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
-    coverage_bps, AssetRecord, Coverage, CoverageStatus, CoveredInfo, PendingUpgrade,
-    RegistryClient, ReserveReport, Role, StaleInfo, SupplySnapshot, SupplyTokenClient, Tier,
-    INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS, MIN_PLAUSIBLE_BPS,
-    PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD, SECONDS_PER_LEDGER, UPGRADE_DELAY_LEDGERS,};
+    coverage_bps as compute_bps, AssetRecord, Coverage, CoverageStatus, CoveredInfo,
+    PendingUpgrade, RegistryClient, ReserveReport, Role, StaleInfo, SupplySnapshot,
+    SupplyTokenClient, Tier, DAY_IN_LEDGERS, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD,
+    MAX_PLAUSIBLE_BPS, MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD,
+    SECONDS_PER_LEDGER, UPGRADE_DELAY_LEDGERS,
+};
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
     Address, BytesN, ContractExecutable, Env, Executable, String, Vec,
@@ -422,12 +420,6 @@ fn counts(registry: &RegistryClient, report: &ReserveReport) -> bool {
 /// order), so on equal `as_of` the earlier one wins. The registry is asked
 /// only about the report that would win, and again only if that one no longer
 /// counts, so a fresh issuer-signed report costs no cross-contract call at all.
-fn pick_counting(
-    env: &Env,
-    sac: &Address,
-    mut candidates: Vec<ReserveReport>,
-) -> Option<ReserveReport> {
-/// The freshest counting report in `candidates`.
 ///
 /// Two-phase per iteration: (1) a single O(n) index scan that finds the
 /// globally freshest non-rejected candidate without touching the registry,
@@ -437,7 +429,12 @@ fn pick_counting(
 /// A bitmask tracks rejected positions; `candidates` is never mutated.
 /// We have at most 3 tiers × (1 legacy + MAX_REPORTERS_PER_TIER) = 15
 /// entries, so a u32 bitmask is always sufficient.
-fn pick_counting(env: &Env, candidates: Vec<ReserveReport>) -> Option<ReserveReport> {    let registry = RegistryClient::new(env, &registry(env));
+fn pick_counting(
+    env: &Env,
+    sac: &Address,
+    candidates: Vec<ReserveReport>,
+) -> Option<ReserveReport> {
+    let registry = RegistryClient::new(env, &registry(env));
     let n = candidates.len();
     let mut skip: u32 = 0;
     loop {
@@ -460,12 +457,11 @@ fn pick_counting(env: &Env, candidates: Vec<ReserveReport>) -> Option<ReserveRep
                 }
             });
         }
-        let (i, report) = best?;
-        if counts(&registry, &report) && !is_disputed(env, sac, &report) {
         // Phase 2: check only the winner.
         let i = best_i?;
         let report = candidates.get(i).unwrap();
-        if counts(&registry, &report) {            return Some(report);
+        if counts(&registry, &report) && !is_disputed(env, sac, &report) {
+            return Some(report);
         }
         skip |= 1u32 << i;
     }
