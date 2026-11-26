@@ -201,11 +201,16 @@ pub struct DisputeResolved {
     pub sac: Address,
     #[topic]
     pub as_of: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetAliased {
     #[topic]
     pub old: Address,
     #[topic]
-    pub new: Address,}
+    pub new: Address,
+}
 
 #[contract]
 pub struct CoverageLedger;
@@ -249,6 +254,9 @@ fn is_disputed(env: &Env, sac: &Address, report: &ReserveReport) -> bool {
     match read_persistent::<DisputeRecord>(env, &key) {
         None => false,
         Some(_) => true,
+    }
+}
+
 fn paused_flag(env: &Env) -> bool {
     env.storage()
         .instance()
@@ -261,7 +269,8 @@ fn paused_flag(env: &Env) -> bool {
 /// reason callers see.
 fn require_not_paused(env: &Env) {
     if paused_flag(env) {
-        panic_with_error!(env, LedgerError::Paused);    }
+        panic_with_error!(env, LedgerError::Paused);
+    }
 }
 
 fn read_persistent<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
